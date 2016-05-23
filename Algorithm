@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+import pytz
+import statsmodels.api as sm
+
+def initialize(context):
+    #trading/backtester settings
+    #effect of trading on the market
+    set_slippage(slippage.FixedSlippage(spread=0))
+    #every trade costs 1 dollar
+    set_commission(commission.PerTrade(cost=1))
+    #check if the symbol was on the market on 1 January 2015
+    set_symbol_lookup_date('2015-01-01')
+    
+    #stock pairs
+    context.stock_pairs = [(sid(14014), sid(2853)),
+                           (sid(1900), sid(2518)),
+                          (sid(4485), sid(34014)),
+                          (sid(8677), sid(34014)),
+                          (sid(67), sid(13940))]
+    
+    context.security_list = []
+    for first_sec, second_sec in context.stock_pairs:
+        context.security_list.append(first_sec)
+        context.security_list.append(second_sec)    
+    
+    #number of pairs
+    context.number_of_pairs=len(context.stock_pairs)
+    
+    #lookback timeframes for the algorithm
+    context.movingaverage_timeframe = 30
+    context.zscore_timeframe=30
+    
+    #calculating the spread
+    context.spread = np.ndarray((context.number_of_pairs, 0))
+    #context.spreads=[]
+    
+    #check if the pairs are in trade, set to false basically
+    context.inshort=[False] * context.number_of_pairs
+    context.inlong=[False] * context.number_of_pairs
+    
+    #algorithm works 30 mins before closing
+    schedule_function(handle_data,date_rules.every_day(), time_rules.market_close(minutes=30))
+  
+    
+    
+    #dollar-neutral property setting
+    context.max_notional = 100000
+    context.min_notional = -100000
+    
+def handle_data(context, data):
+    #returns the open orders from the stock list
+    if get_open_orders():
+        return
+    
+    #historical prices
+    price_history=data.history(context.security_list,'price',365, '1d')
+
+    #sampling the last 30 days
+    prices=price_history.iloc[-context.movingaverage_timeframe::]
+    
+    #spread calculation
+    new_spreads = np.ndarray((context.number_of_pairs, 1))
+    
+    for i in range(context.number_of_pairs):
+
+        (stock1, stock2) = context.stock_pairs[i]
+
+        S1 =  prices[stock1].values
+        S2 =  prices[stock2].values
+
+        #calculating the hedge ratio/beta
+        hedge_ratio = ols_transform(prices, S1, S2)
+    
+        #calculating the new spread
+        new_spreads[i,:] = data.current(stock1, 'price') - hedge_ratio * data.current(stock2, 'price') 
+        
+        if context.spread.shape[1] > context.zscore_timeframe:
+            #if the equality is not true, it calculates the zscore again
+            spreads = context.spread[i, -context.zscore_timeframe:]
+
+            #zscore calculation
+            zscore = (spreads[-1] - spreads.mean()) / spreads.std()
+            
+        
+            #2=entry threshold
+            if zscore >2 and (not context.inlong[i]) and all(data.can_trade([stock1,stock2])):
+                order_target_percent(stock1, -0.5) 
+                order_target_percent(stock2, 0.5) 
+                context.inlong[i] = True
+                context.inshort[i] = False
+            
+            #-2=entry threshold
+            elif zscore < -2  and (not context.inshort[i]) and all(data.can_trade([stock1,stock2])):
+                order_target_percent(stock1, 0.5) 
+                order_target_percent(stock2, -0.5)  
+                context.inlong[i] = False
+                context.inshort[i] = True
+                
+            #1=exit threshold
+            elif abs(zscore) < 1  and all(data.can_trade([stock1,stock2])):
+                order(stock1, 0) 
+                order(stock2, 0) 
+                context.inlong[i] = False
+                context.inshort[i] = False
+                
+        
+    context.spread = np.hstack([context.spread, new_spreads])
+
+#ols linear regression             
+def ols_transform(prices, S1, S2):
+    S2 = sm.add_constant(S2, prepend=True)
+    hedge_ratio = sm.OLS(S1, S2).fit().params[0]
+    return hedge_ratio
+    
